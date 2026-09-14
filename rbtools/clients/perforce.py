@@ -189,6 +189,26 @@ class P4Wrapper(object):
         """
         return self.run_p4(['files', path], marshalled=True)
 
+    def changes(
+        self,
+        path: str,
+    ) -> Sequence[Mapping[str, Any]]:
+        """Return a list of submitted changelists within the given range.
+
+        Args:
+            path (str):
+                The Perforce path to check, scoped to a revision range
+                (e.g. ``//...@X,Y``).
+
+        Returns:
+            list:
+            A list of dictionaries, one per changelist, each containing at
+            least ``change`` (the changelist number) and ``desc`` (the
+            full changelist description) keys, ordered from most recent to
+            oldest.
+        """
+        return self.run_p4(['changes', '-l', path], marshalled=True)
+
     def filelog(
         self,
         path: str,
@@ -1034,8 +1054,20 @@ class PerforceClient(BaseSCMClient):
         If a single revision is passed in, this will return the parent of
         that revision for "base" and the passed-in revision for "tip".
 
-        If two revisions are passed in, they need to both be submitted
-        changesets.
+        If two submitted revisions are passed in, they'll be treated as the
+        endpoints of a range of submitted changelists.
+
+        If two or more pending/shelved revisions are passed in, they'll be
+        combined into a single review request, made up of the union of the
+        opened files across all of the given changelists.
+
+        Version Changed:
+            (unreleased):
+            Added support for combining two or more pending or shelved
+            changelists into a single review request. Previously, only
+            exactly two *submitted* changelists (treated as a range) were
+            accepted; anything else with more than one revision raised
+            :py:class:`~rbtools.clients.errors.TooManyRevisionsError`.
 
         Args:
             revisions (list of str, optional):
@@ -1119,37 +1151,72 @@ class PerforceClient(BaseSCMClient):
                 raise InvalidRevisionSpecError(
                     '%s does not appear to be a valid changelist' %
                     revisions[0])
-        elif n_revs == 2:
-            # The base revision must be a submitted CLN.
-            status = self._get_changelist_status(revisions[0])
-
-            if status in ('pending', 'shelved'):
-                raise InvalidRevisionSpecError(
-                    '%s cannot be used as the base CLN for a diff because '
-                    'it is %s.' % (revisions[0], status))
-            elif status != 'submitted':
-                raise InvalidRevisionSpecError(
-                    '%s does not appear to be a valid changelist' %
-                    revisions[0])
-
-            # Tip revision can be any of submitted, pending, or shelved CLNs.
-            status = self._get_changelist_status(revisions[1])
-
-            if status in ('pending', 'shelved'):
-                raise InvalidRevisionSpecError(
-                    '%s cannot be used for a revision range diff because it '
-                    'is %s' % (revisions[1], status))
-            elif status != 'submitted':
-                raise InvalidRevisionSpecError(
-                    '%s does not appear to be a valid changelist' %
-                    revisions[1])
-
-            return {
-                'base': revisions[0],
-                'tip': revisions[1],
-            }
         else:
-            raise TooManyRevisionsError
+            # Two or more revisions were given. There are two supported
+            # cases here:
+            #
+            # 1) Exactly two *submitted* changelists, treated as the
+            #    (exclusive, inclusive] endpoints of a range.
+            #
+            # 2) Two or more *pending* or *shelved* changelists, which will
+            #    be combined into a single review request made up of the
+            #    union of their opened files.
+            #
+            # Mixing submitted changelists with pending/shelved ones is not
+            # supported, since a submitted changelist can't meaningfully be
+            # combined with a pending changelist's open files.
+            statuses = [
+                self._get_changelist_status(revision)
+                for revision in revisions
+            ]
+
+            if all(status == 'submitted' for status in statuses):
+                if n_revs > 2:
+                    raise TooManyRevisionsError
+
+                base_status = statuses[0]
+
+                if base_status in ('pending', 'shelved'):
+                    raise InvalidRevisionSpecError(
+                        '%s cannot be used as the base CLN for a diff '
+                        'because it is %s.' % (revisions[0], base_status))
+                elif base_status != 'submitted':
+                    raise InvalidRevisionSpecError(
+                        '%s does not appear to be a valid changelist' %
+                        revisions[0])
+
+                tip_status = statuses[1]
+
+                if tip_status in ('pending', 'shelved'):
+                    raise InvalidRevisionSpecError(
+                        '%s cannot be used for a revision range diff '
+                        'because it is %s' % (revisions[1], tip_status))
+                elif tip_status != 'submitted':
+                    raise InvalidRevisionSpecError(
+                        '%s does not appear to be a valid changelist' %
+                        revisions[1])
+
+                return {
+                    'base': revisions[0],
+                    'tip': revisions[1],
+                }
+            elif any(status == 'submitted' for status in statuses):
+                raise InvalidRevisionSpecError(
+                    'Cannot mix submitted changelists with pending or '
+                    'shelved changelists when specifying multiple '
+                    'changelists.')
+            else:
+                for revision, status in zip(revisions, statuses):
+                    if status not in ('pending', 'shelved'):
+                        raise InvalidRevisionSpecError(
+                            '%s does not appear to be a valid changelist'
+                            % revision)
+
+                return {
+                    'base': self.REVISION_CURRENT_SYNC,
+                    'tip': (self.REVISION_PENDING_CLN_PREFIX +
+                            ','.join(revisions)),
+                }
 
     def _get_changelist_status(self, changelist):
         """Return the status of a changelist.
@@ -1303,7 +1370,6 @@ class PerforceClient(BaseSCMClient):
         diff_writer = UnifiedDiffWriter(stream)
 
         cl_is_pending = tip.startswith(self.REVISION_PENDING_CLN_PREFIX)
-        cl_is_shelved = False
 
         if not cl_is_pending:
             # Submitted changes are handled by a different method
@@ -1332,23 +1398,51 @@ class PerforceClient(BaseSCMClient):
 
             return result
 
-        # Strip off the prefix
+        # Strip off the prefix. This may be a single changelist number, or
+        # (when combining multiple pending/shelved changelists into one
+        # review request) a comma-separated list of changelist numbers.
         tip = tip.split(':', 1)[1]
+        cln_list = tip.split(',')
+        is_combining_clns = len(cln_list) > 1
 
-        # Try to get the files out of the working directory first. If that
-        # doesn't work, look at shelved files.
-        opened_files = self.p4.opened(tip)
-        if not opened_files:
-            opened_files = self.p4.files('//...@=%s' % tip)
-            cl_is_shelved = True
+        # Gather the opened (or shelved) files for every changelist being
+        # posted. Each entry is a 3-tuple of (file record, source CLN,
+        # whether that particular CLN's data was pulled from the shelf).
+        file_entries: list[tuple[Mapping[str, Any], str, bool]] = []
+        seen_depot_files: set[str] = set()
 
-        if not opened_files:
-            raise EmptyChangeError
+        for cln in cln_list:
+            files_for_cln = self.p4.opened(cln)
+            shelved_for_cln = False
 
-        if cl_is_shelved:
-            logger.info('Generating diff for shelved changeset %s', tip)
-        else:
-            logger.info('Generating diff for pending changeset %s', tip)
+            if not files_for_cln:
+                files_for_cln = self.p4.files('//...@=%s' % cln)
+                shelved_for_cln = True
+
+            if not files_for_cln:
+                raise EmptyChangeError
+
+            for record in files_for_cln:
+                depot_file = record['depotFile']
+
+                if is_combining_clns and depot_file in seen_depot_files:
+                    raise SCMError(
+                        'The file %s is open in more than one of the '
+                        'specified changelists. A file can only be '
+                        'included from one changelist at a time.'
+                        % depot_file)
+
+                seen_depot_files.add(depot_file)
+                file_entries.append((record, cln, shelved_for_cln))
+
+        if is_combining_clns:
+            logger.info('Generating diff for combined changelists: %s',
+                        ', '.join(cln_list))
+        elif file_entries:
+            logger.info(
+                'Generating diff for %s changeset %s',
+                'shelved' if file_entries[0][2] else 'pending',
+                cln_list[0])
 
         action_mapping = {
             'edit': 'M',
@@ -1365,7 +1459,13 @@ class PerforceClient(BaseSCMClient):
         # files when the changeset is shelved, because none of the usual
         # methods (fstat, filelog) provide the source move information when the
         # changeset is shelved.
-        if self._supports_moves() and not cl_is_shelved:
+        #
+        # Since moves can't reliably be detected for shelved changesets, we
+        # conservatively require that *none* of the changelists being
+        # diffed are shelved before treating moves as moves.
+        any_shelved = any(shelved for _, _, shelved in file_entries)
+
+        if self._supports_moves() and not any_shelved:
             action_mapping['move/add'] = 'MV-a'
             action_mapping['move/delete'] = 'MV'
         else:
@@ -1375,7 +1475,7 @@ class PerforceClient(BaseSCMClient):
             action_mapping['move/add'] = 'A'
             action_mapping['move/delete'] = 'D'
 
-        for f in opened_files:
+        for f, cln, cl_is_shelved in file_entries:
             depot_file = f['depotFile']
             local_file = self._depot_to_local(depot_file)
             new_depot_file = ''
@@ -1409,14 +1509,12 @@ class PerforceClient(BaseSCMClient):
                                % (action, depot_file))
 
             if changetype_short == 'M':
-                assert tip is not None
-
                 try:
                     old_file, new_file = self._extract_edit_files(
                         depot_file=depot_file,
                         local_file=local_file,
                         rev_a=base_revision,
-                        rev_b=tip,
+                        rev_b=cln,
                         cl_is_shelved=cl_is_shelved)
                 except ValueError as e:
                     if not self.config.get('SUPPRESS_CLIENT_WARNINGS', False):
@@ -1440,7 +1538,7 @@ class PerforceClient(BaseSCMClient):
                     old_file, new_file = self._extract_add_files(
                         depot_file=depot_file,
                         local_file=local_file,
-                        revision=tip,
+                        revision=cln,
                         cl_is_shelved=cl_is_shelved,
                         cl_is_pending=cl_is_pending)
                 except ValueError as e:
@@ -1475,7 +1573,7 @@ class PerforceClient(BaseSCMClient):
                     old_file, new_file, new_depot_file = \
                         self._extract_move_files(
                             old_depot_file=depot_file,
-                            tip=tip,
+                            tip=cln,
                             base_revision=base_revision,
                             cl_is_shelved=cl_is_shelved)
                 except ValueError as e:
@@ -1506,6 +1604,10 @@ class PerforceClient(BaseSCMClient):
         This is only used when the client is supposed to send a change number
         to the server (such as with Perforce).
 
+        When the revisions represent two or more combined pending/shelved
+        changelists, there is no single Perforce changenum that represents
+        the review request, so ``None`` is returned.
+
         Args:
             revisions (dict):
                 A revisions dictionary as returned by ``parse_revision_spec``.
@@ -1526,10 +1628,56 @@ class PerforceClient(BaseSCMClient):
 
             if tip.startswith(self.REVISION_PENDING_CLN_PREFIX):
                 tip = tip[len(self.REVISION_PENDING_CLN_PREFIX):]
+
+                if ',' in tip:
+                    # Multiple changelists were combined into a single
+                    # review request. There's no single Perforce changenum
+                    # to report.
+                    return None
+
                 if tip != self.REVISION_DEFAULT_CLN:
                     return tip
 
         return None
+
+    def _get_range_diff_scan_path(self) -> str:
+        """Return the depot path prefix to scan for a changelist-range diff.
+
+        This is used to scope the :command:`p4 filelog` query run by
+        :py:meth:`_compute_range_changes`. If ``--basedir`` was passed on
+        the command line and looks like a Perforce depot path (starting
+        with ``//``), that path is used to scope the scan, so that only
+        changes relevant to that part of the depot are considered.
+
+        If ``--basedir`` wasn't given, or doesn't look like a depot path
+        (e.g. it's a plain local directory, as used by other SCMs that
+        also support this option), the entire depot (``//...``) is
+        scanned, matching the original, unscoped behavior.
+
+        Note:
+            This is a heuristic based on how ``--basedir`` happens to be
+            used for Perforce. Its documented purpose is only to override
+            diff path metadata, not to filter which files are included,
+            so this does change file-selection behavior for anyone
+            passing ``--basedir`` without expecting it to also scope the
+            diff.
+
+        Returns:
+            str:
+            A Perforce depot path pattern (ending in a recursive
+            wildcard) to pass to :command:`p4 filelog`.
+        """
+        basedir = getattr(self.options, 'basedir', None)
+
+        if not basedir or not basedir.startswith('//'):
+            return '//...'
+
+        if basedir.endswith('...'):
+            return basedir
+        elif basedir.endswith('/'):
+            return basedir + '...'
+        else:
+            return basedir + '/...'
 
     def _compute_range_changes(
         self,
@@ -1583,7 +1731,26 @@ class PerforceClient(BaseSCMClient):
         # [base, tip]. Increment the base to avoid this.
         real_base = str(int(base) + 1)
 
-        file_log = self.p4.filelog('//...@%s,%s' % (real_base, tip)) or []
+        # NOTE: The original rbtools code always scanned the entire depot
+        # ('//...') here, regardless of --basedir or any -I/-X options.
+        # This meant that a submitted-changelist-range diff would pull in
+        # *every* file submitted anywhere in the depot between the two
+        # changelists, not just files relevant to the review -- including
+        # files the user may not even have in their client view (which can
+        # cause a later crash/warning when we try to resolve them to a
+        # local path).
+        #
+        # If --basedir looks like a Perforce depot path, we scope the
+        # filelog scan to it instead. This is a heuristic: --basedir's
+        # documented purpose is just to override diff path metadata, not
+        # to filter file selection, so this changes behavior for anyone
+        # relying on the old "scan everything" semantics while passing
+        # --basedir for its original purpose. If that's a problem, this
+        # should be made opt-in (e.g. via a dedicated flag) rather than
+        # automatic.
+        scan_path = self._get_range_diff_scan_path()
+
+        file_log = self.p4.filelog('%s@%s,%s' % (scan_path, real_base, tip)) or []
 
         for file_entry in file_log:
             cid = 0
@@ -1633,9 +1800,49 @@ class PerforceClient(BaseSCMClient):
                 }
 
                 if action == 'move/add':
-                    change['oldFilename'] = file_entry['file0,%d' % cid]
+                    # NOTE: The original rbtools code used
+                    # 'file0,%d' % cid here, which raised a KeyError for
+                    # revision index 1. Debug logging against a real
+                    # depot confirmed that move/delete records use
+                    # 'file1,%d' % cid (the original, unmodified formula
+                    # for that branch), so this now uses the same
+                    # 'file1,%d' formula for move/add too, on the
+                    # assumption that Perforce stores the "other end" of
+                    # a move under the file1 key regardless of direction.
+                    #
+                    # Some move/delete records were observed with *no*
+                    # file* keys at all (no integration data returned by
+                    # p4 filelog for that entry -- seen in practice for
+                    # files outside the requesting user's client view).
+                    # In that case, we can't reliably determine the
+                    # other end of the move, so we downgrade this entry
+                    # to a plain add rather than guessing a filename.
+                    key = 'file1,%d' % cid
+
+                    if key in file_entry:
+                        change['oldFilename'] = file_entry[key]
+                    else:
+                        logger.debug(
+                            'Move/add record for %s (rev index %d) has '
+                            'no integration data (missing key %r). '
+                            'Treating as a plain add instead of a move.',
+                            depot_file, cid, key)
+                        action = 'add'
+                        change['action'] = action
                 elif action == 'move/delete':
-                    change['newFilename'] = file_entry['file1,%d' % cid]
+                    key = 'file1,%d' % cid
+
+                    if key in file_entry:
+                        change['newFilename'] = file_entry[key]
+                    else:
+                        logger.debug(
+                            'Move/delete record for %s (rev index %d) has '
+                            'no integration data (missing key %r). '
+                            'Treating as a plain delete instead of a '
+                            'move.',
+                            depot_file, cid, key)
+                        action = 'delete'
+                        change['action'] = action
 
                 cid += 1
 
@@ -1705,7 +1912,14 @@ class PerforceClient(BaseSCMClient):
                 continue
 
             if action == 'add':
-                assert local_file is not None
+                if local_file is None:
+                    if not self.config.get('SUPPRESS_CLIENT_WARNINGS', False):
+                        logger.warning(
+                            'Skipping file %s: could not resolve to a '
+                            'local path in the current client view',
+                            depot_file)
+
+                    continue
 
                 try:
                     old_file, new_file = self._extract_add_files(
@@ -1750,7 +1964,14 @@ class PerforceClient(BaseSCMClient):
                               changetype_short='D',
                               ignore_unmodified=True)
             elif action == 'edit':
-                assert local_file is not None
+                if local_file is None:
+                    if not self.config.get('SUPPRESS_CLIENT_WARNINGS', False):
+                        logger.warning(
+                            'Skipping file %s: could not resolve to a '
+                            'local path in the current client view',
+                            depot_file)
+
+                    continue
 
                 try:
                     old_file, new_file = self._extract_edit_files(
@@ -1776,7 +1997,14 @@ class PerforceClient(BaseSCMClient):
                               changetype_short='M',
                               ignore_unmodified=True)
             elif action == 'move':
-                assert local_file is not None
+                if local_file is None:
+                    if not self.config.get('SUPPRESS_CLIENT_WARNINGS', False):
+                        logger.warning(
+                            'Skipping file %s: could not resolve to a '
+                            'local path in the current client view',
+                            depot_file)
+
+                    continue
 
                 try:
                     old_file_a, new_file_a = self._extract_add_files(
@@ -2520,11 +2748,53 @@ class PerforceClient(BaseSCMClient):
             # XXX: This breaks on filenames with spaces.
             return where_output[-1]['data'].split(' ')[2].strip()
 
+    def _get_basedir_label(self):
+        """Return a short label derived from the --basedir option.
+
+        ``--basedir`` is typically a long depot path (optionally ending in
+        a recursive wildcard, e.g. ``//depot/.../Component/SubComponent/
+        ...``). Only the last two non-empty path segments are used, since
+        that's usually enough to identify the component the review
+        applies to without cluttering the description with the full
+        depot path.
+
+        Returns:
+            str:
+            The last two path segments of ``--basedir``, joined by a
+            slash, or ``None`` if ``--basedir`` wasn't given.
+        """
+        basedir = getattr(self.options, 'basedir', None)
+
+        if not basedir:
+            return None
+
+        segments = [
+            segment
+            for segment in basedir.split('/')
+            if segment and segment != '...'
+        ]
+
+        if not segments:
+            return None
+
+        return '/'.join(segments[-2:])
+
     def get_raw_commit_message(self, revisions):
         """Extract the commit message based on the provided revision range.
 
         Since local changelists in Perforce are not ordered with respect to
-        one another, this implementation looks at only the tip revision.
+        one another, single-changelist reviews look at only that
+        changelist's description.
+
+        When the tip revision represents two or more combined pending or
+        shelved changelists, the descriptions of all of the changelists are
+        concatenated together, each prefixed with its changelist number.
+
+        When the revisions represent a range of two or more *submitted*
+        changelists (e.g. ``rbt post 100 105``), the descriptions of every
+        changelist in ``(base, tip]`` are fetched and concatenated
+        together, each prefixed with its changelist number, and the whole
+        block is prefixed with a ``[basedir base - tip]`` header.
 
         Args:
             revisions (dict):
@@ -2542,18 +2812,98 @@ class PerforceClient(BaseSCMClient):
         if ':' in changelist:
             changelist = changelist.split(':', 1)[1]
 
+        if ',' in changelist:
+            # Multiple changelists were combined into a single review
+            # request. Concatenate their descriptions together.
+            descriptions = []
+
+            for cln in changelist.split(','):
+                logger.debug('Fetching description for changelist %s', cln)
+                change = self.p4.change(cln)
+
+                if len(change) == 1 and 'Description' in change[0]:
+                    descriptions.append(
+                        '[%s] %s' % (cln, change[0]['Description'].strip()))
+
+            return '\n\n'.join(descriptions)
+
         if changelist == self.REVISION_DEFAULT_CLN:
             # The default changelist has no description and couldn't be
             # accessed from p4 change anyway
             return ''
 
+        base = revisions.get('base')
+        tip = revisions.get('tip')
+
+        # Only treat this as a submitted changelist range when both
+        # endpoints are actual submitted changelist numbers (as opposed
+        # to sentinel values like REVISION_CURRENT_SYNC or a
+        # REVISION_PENDING_CLN_PREFIX-tagged pending changelist).
+        if (isinstance(base, str) and isinstance(tip, str) and
+            base.isdigit() and tip.isdigit()):
+            return self._get_range_commit_message(base, tip)
+
         logger.debug('Fetching description for changelist %s', changelist)
         change = self.p4.change(changelist)
 
         if len(change) == 1 and 'Description' in change[0]:
-            return change[0]['Description']
+            return change[0]['Description'].strip()
         else:
             return ''
+
+    def _get_range_commit_message(self, base, tip):
+        """Return a commit message built from every changelist in a range.
+
+        This fetches the descriptions of every submitted changelist in
+        ``(base, tip]`` (scoped to ``--basedir``, if given) and
+        concatenates them together, each prefixed with its own changelist
+        number, under a single header identifying the overall range.
+
+        Args:
+            base (str):
+                The base changelist number (exclusive).
+
+            tip (str):
+                The tip changelist number (inclusive).
+
+        Returns:
+            str:
+            The combined commit message for the range.
+        """
+        scan_path = self._get_range_diff_scan_path()
+
+        # We want descriptions for (base, tip], but "p4 changes" with a
+        # revision range of X,Y is inclusive of X. Increment the base to
+        # avoid picking up the changelist just before the range.
+        real_base = str(int(base) + 1)
+
+        logger.debug('Fetching descriptions for changelists %s through %s',
+                     real_base, tip)
+
+        changes = self.p4.changes(
+            '%s@%s,%s' % (scan_path, real_base, tip)) or []
+
+        # "p4 changes" lists results newest-first. Reverse them so the
+        # descriptions read in the order the changes were actually made.
+        descriptions = [
+            '@%s %s' % (change['change'], change['desc'].strip())
+            for change in reversed(changes)
+            if 'change' in change and 'desc' in change
+        ]
+
+        basedir_label = self._get_basedir_label()
+
+        if basedir_label:
+            header = '[%s %s - %s]' % (basedir_label, base, tip)
+        else:
+            header = '[%s - %s]' % (base, tip)
+
+        if descriptions:
+            return '%s\n\n%s' % (header, '\n\n'.join(descriptions))
+
+        return header
+
+
 
     def _supports_moves(self):
         """Return whether the Review Board server supports moved files.
@@ -2702,7 +3052,8 @@ class PerforceClient(BaseSCMClient):
 
         Raises:
             rbtools.clients.errors.AmendError:
-                The given changelist could not be amended.
+                The given changelist could not be amended, or the given
+                revisions represent more than one combined changelist.
         """
         # Get the changelist number from the tip revision, removing the prefix
         # if necessary. Don't allow amending submitted or default changelists.
@@ -2714,6 +3065,11 @@ class PerforceClient(BaseSCMClient):
                              % changelist_id)
 
         changelist_num = changelist_id.split(':', 1)[1]
+
+        if ',' in changelist_num:
+            raise AmendError(
+                'Cannot amend a review request created from multiple '
+                'combined changelists.')
 
         if changelist_num == self.REVISION_DEFAULT_CLN:
             raise AmendError('Cannot modify the default changelist')
