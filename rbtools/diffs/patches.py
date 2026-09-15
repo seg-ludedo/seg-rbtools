@@ -16,10 +16,8 @@ from typing import Literal, TYPE_CHECKING
 from urllib.error import URLError
 from urllib.request import urlopen
 
-from housekeeping import deprecate_non_keyword_only_args
 from typelets.runtime import raise_invalid_type
 
-from rbtools.deprecation import RemovedInRBTools70Warning
 from rbtools.utils.filesystem import make_tempfile
 
 if TYPE_CHECKING:
@@ -184,7 +182,12 @@ class PatchAuthor:
     <rbtools.clients.base.scmclient.BaseSCMClient.apply_patch>`.
 
     Version Changed:
+        7.0:
+        * Removed the deprecated ``fullname`` property.
+
+    Version Changed:
         5.1:
+        * Added the ``full_name`` property and deprecated ``fullname``.
         * Moved from ``rbtools.clients.base.patch``.
 
     Version Changed:
@@ -203,10 +206,9 @@ class PatchAuthor:
     #:
     #: Version Added:
     #:     5.1:
-    #:     This was added as a replacement for :py:attr:`fullname`.
+    #:     This was added as a replacement for ``fullname``.
     full_name: str
 
-    @deprecate_non_keyword_only_args(RemovedInRBTools70Warning)
     def __init__(
         self,
         *,
@@ -214,6 +216,10 @@ class PatchAuthor:
         email: str,
     ) -> None:
         """Initialize the author information.
+
+        Version Changed:
+            7.0:
+            Positional arguments are no longer supported.
 
         Version Changed:
             5.1:
@@ -229,26 +235,6 @@ class PatchAuthor:
         """
         self.full_name = full_name
         self.email = email
-
-    @property
-    def fullname(self) -> str:
-        """The full name  of this author.
-
-        Deprecated:
-            5.1:
-            This is deprecated in favor of :py:attr:`full_name`. It will be
-            removed in RBTools 7.
-
-        Returns:
-            bool:
-            The full name of the author.
-        """
-        RemovedInRBTools70Warning.warn(
-            'PatchAuthor.fullname is deprecated. Please use '
-            'PatchAuthor.full_name instead. This will be removed in '
-            'RBTools 7.')
-
-        return self.full_name
 
     def __eq__(
         self,
@@ -407,17 +393,6 @@ class Patch:
         """
         if not content and not path:
             raise ValueError(_('Either content= or path= must be provided.'))
-
-        if isinstance(prefix_level, str):
-            RemovedInRBTools70Warning.warn(
-                'prefix_level must be an integer, not a string. Support '
-                'for string prefix levels will be removed in RBTools 7.')
-
-            try:
-                prefix_level = int(prefix_level)
-            except ValueError:
-                # We'll cover this below.
-                pass
 
         if prefix_level is not None and not isinstance(prefix_level, int):
             raise_invalid_type(
@@ -633,7 +608,6 @@ class PatchResult:
     #:     6.0
     binary_failed: Mapping[str, str]
 
-    @deprecate_non_keyword_only_args(RemovedInRBTools70Warning)
     def __init__(
         self,
         *,
@@ -649,9 +623,13 @@ class PatchResult:
         """Initialize the object.
 
         Version Changed:
+            7.0:
+            Positional arguments are no longer supported.
+
+        Version Changed:
             5.1:
             * This now requires keyword-only arguments. Support for positional
-              arguments will be removed in RBTools 7.
+            arguments will be removed in RBTools 7.
 
             * Added the ``patch`` and ``patch_range`` arguments.
 

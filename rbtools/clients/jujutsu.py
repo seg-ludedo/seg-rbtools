@@ -24,6 +24,7 @@ from rbtools.clients.base.scmclient import (
 from rbtools.clients.errors import (
     AmendError,
     CreateCommitError,
+    InvalidRevisionSpecError,
     MergeError,
     PushError,
     SCMError,
@@ -511,7 +512,7 @@ class JujutsuClient(BaseSCMClient):
         elif n_revs == 1:
             # A single revision was passed in. This could be an actual single
             # revision, or it could be a revset that represents a range.
-            changes = self._get_change_ids(revisions[0])
+            changes = self._resolve_revset(revisions[0])
             n_changes = len(changes)
 
             if n_changes == 1:
@@ -519,6 +520,16 @@ class JujutsuClient(BaseSCMClient):
                 # find its parent as the base.
                 tip = changes[0]
                 base = self._get_change_id(f'{tip}-')
+
+                if not base:
+                    # Only the root commit has no parent.
+                    raise InvalidRevisionSpecError(
+                        _(
+                            'Revision "{revision}" is the root commit, which '
+                            'has no changes.'
+                        )
+                        .format(revision=revisions[0]))
+
                 parent_bookmark = self._get_parent_bookmark(base)
 
                 result = {
@@ -539,8 +550,8 @@ class JujutsuClient(BaseSCMClient):
                     'tip': tip,
                 }
         elif n_revs == 2:
-            base = self._get_change_id(revisions[0])
-            tip = self._get_change_id(revisions[1])
+            base = self._resolve_revset(revisions[0])[0]
+            tip = self._resolve_revset(revisions[1])[0]
             parent_bookmark = self._get_parent_bookmark(base)
 
             result = {
@@ -1211,9 +1222,13 @@ class JujutsuClient(BaseSCMClient):
             diff_lines: list[bytes] = []
 
             for filename in changed_files:
+                # jj parses paths as filesets, where characters like "," are
+                # operators. Quote the name as an exact file pattern.
+                escaped = filename.replace('\\', '\\\\').replace('"', '\\"')
+
                 lines = (
                     run_process(['jj', 'diff', '--git', '--from', base,
-                                 '--to', tip, '--', filename])
+                                 '--to', tip, '--', f'file:"{escaped}"'])
                     .stdout_bytes
                     .readlines()
                 )
@@ -1416,6 +1431,43 @@ class JujutsuClient(BaseSCMClient):
             .splitlines()
         )
 
+    def _resolve_revset(
+        self,
+        revset: str,
+    ) -> Sequence[str]:
+        """Return the change IDs for a user-provided revset.
+
+        Unlike :py:meth:`_get_change_ids`, this reports problems with the
+        revset in a form suitable for showing to the user.
+
+        Args:
+            revset (str):
+                The revset to query.
+
+        Returns:
+            list of str:
+            A non-empty list of the change IDs in the revset.
+
+        Raises:
+            rbtools.clients.errors.InvalidRevisionSpecError:
+                The revset could not be parsed or did not match any changes.
+        """
+        try:
+            changes = self._get_change_ids(revset)
+        except RunProcessError as e:
+            error = e.result.stderr.read().strip().removeprefix('Error: ')
+
+            raise InvalidRevisionSpecError(
+                _('Invalid revision "{revset}": {error}')
+                .format(revset=revset, error=error))
+
+        if not changes:
+            raise InvalidRevisionSpecError(
+                _('Revision "{revset}" did not match any changes.')
+                .format(revset=revset))
+
+        return changes
+
     def _get_remotes(
         self,
     ) -> Sequence[str]:
@@ -1505,7 +1557,7 @@ class JujutsuClient(BaseSCMClient):
                 An error occurred while processing the diff.
         """
         index_re = re.compile(
-            br'^index (?P<a>[0-9a-f]+)..(?P<b>[0-9a-f]+)((?P<rest>\s.*)?)$')
+            br'^index (?P<a>[0-9a-f]+)..(?P<b>[0-9a-f]+)((?P<rest> .*)?)$')
         sha_result_re = re.compile(r'^(?P<sha>[0-9a-f]+) blob \d+$')
 
         with subprocess.Popen(

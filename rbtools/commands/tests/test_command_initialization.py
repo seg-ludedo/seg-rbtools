@@ -7,6 +7,8 @@ Version Added:
 from __future__ import annotations
 
 import argparse
+import io
+from contextlib import contextmanager, redirect_stdout
 from typing import TYPE_CHECKING
 
 from rbtools.clients import RepositoryInfo
@@ -16,8 +18,10 @@ from rbtools.commands.base.commands import (BaseCommand,
                                             BaseSubCommand)
 from rbtools.commands.base.options import Option
 from rbtools.testing import CommandTestsMixin, TestCase
+from rbtools.ui.console import RBToolsConsole
 
 if TYPE_CHECKING:
+    from collections.abc import Generator
     from typing import Any
 
 
@@ -136,6 +140,7 @@ class CommandInitializationTests(CommandTestsMixin[_TestCommand], TestCase):
     def tearDown(self):
         """Tear down the test case."""
         self.command_cls.option_list = self.original_option_list
+        _TestCommand.progress_description = None
 
         super().tearDown()
 
@@ -196,6 +201,100 @@ class CommandInitializationTests(CommandTestsMixin[_TestCommand], TestCase):
         self.assertEqual(result['exit_code'], 0)
         self.assertEqual(command.server_url,
                          'http://reviews2.example.com/')
+
+    def test_progress_description(self) -> None:
+        """Testing command initialization with progress_description shows a
+        spinner
+        """
+        self.spy_on(RBToolsConsole.progress_bar, owner=RBToolsConsole)
+        _TestCommand.progress_description = 'Testing'
+
+        result = self.run_command(repository_info=RepositoryInfo(path='/path'),
+                                  tool=GitClient())
+
+        self.assertEqual(result['exit_code'], 0)
+        self.assert_spy_called_once_with(RBToolsConsole.progress_bar,
+                                         'Testing')
+
+    def test_progress_description_with_trees_config(self) -> None:
+        """Testing command initialization with progress_description and
+        TREES= in .reviewboardrc restarts the spinner
+        """
+        config: dict[str, Any] = {
+            'REVIEWBOARD_URL': 'http://reviews.example.com/',
+            'TREES': {
+                '/path': {
+                    'REVIEWBOARD_URL': 'http://reviews2.example.com/',
+                },
+            },
+        }
+
+        self.spy_on(RBToolsConsole.progress_bar, owner=RBToolsConsole)
+        _TestCommand.progress_description = 'Testing'
+
+        with self.reviewboardrc(config):
+            result = self.run_command(
+                repository_info=RepositoryInfo(path='/path'),
+                tool=GitClient(),
+                server_url='')
+
+        self.assertEqual(result['exit_code'], 0)
+        self.assertEqual(result['command'].server_url,
+                         'http://reviews2.example.com/')
+        self.assertSpyCallCount(RBToolsConsole.progress_bar, 2)
+
+    def test_progress_description_with_json(self) -> None:
+        """Testing command initialization with progress_description and
+        --json does not show a spinner
+        """
+        self.spy_on(RBToolsConsole.progress_bar, owner=RBToolsConsole)
+        _TestCommand.progress_description = 'Testing'
+
+        result = self.run_command(args=['--json'],
+                                  repository_info=RepositoryInfo(path='/path'),
+                                  tool=GitClient())
+
+        self.assertEqual(result['exit_code'], 0)
+        self.assertSpyNotCalled(RBToolsConsole.progress_bar)
+
+    def test_stop_progress(self) -> None:
+        """Testing BaseCommand.stop_progress stops the spinner before main
+        returns
+        """
+        events: list[str] = []
+
+        @contextmanager
+        def _fake_progress_bar(
+            console: RBToolsConsole,
+            description: str,
+            **kwargs,
+        ) -> Generator[None, None, None]:
+            events.append('start')
+            yield
+            events.append('stop')
+
+        def _fake_main(
+            command: _TestCommand,
+            *args,
+        ) -> int:
+            command.stop_progress()
+            events.append('main done')
+
+            return 0
+
+        self.spy_on(RBToolsConsole.progress_bar,
+                    owner=RBToolsConsole,
+                    call_fake=_fake_progress_bar)
+        self.spy_on(_TestCommand.main,
+                    owner=_TestCommand,
+                    call_fake=_fake_main)
+        _TestCommand.progress_description = 'Testing'
+
+        result = self.run_command(repository_info=RepositoryInfo(path='/path'),
+                                  tool=GitClient())
+
+        self.assertEqual(result['exit_code'], 0)
+        self.assertEqual(events, ['start', 'stop', 'main done'])
 
     def test_with_deprecated_option(self) -> None:
         """Testing warning and help output when passing a deprecated option"""
@@ -354,6 +453,18 @@ class MultiCommandInitializationTests(CommandTestsMixin[_TestMultiCommand],
             subcommand.option_list = self.original_subcommand_option_lists[i]
 
         super().tearDown()
+
+    def test_without_subcommand(self) -> None:
+        """Testing running a multi command without a subcommand prints help"""
+        stdout = io.StringIO()
+
+        with redirect_stdout(stdout):
+            result = self.run_command()
+
+        self.assertEqual(result['exit_code'], 1)
+        self.assertIn('usage: rbt test-multi-command <subcommand>',
+                      stdout.getvalue())
+        self.assertIn('sub-command', stdout.getvalue())
 
     def test_with_common_deprecated_option(self) -> None:
         """Testing warning and help output when passing a common deprecated
