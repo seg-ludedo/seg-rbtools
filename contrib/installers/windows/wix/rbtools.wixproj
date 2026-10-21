@@ -62,9 +62,7 @@
  </Target>
 
  <!-- Sign the installer -->
-<Target Name="SignMsi"
-        AfterTargets="Link"
-        Condition="'$(EnableSigning)' == 'true'">
+ <Target Name="SignMsi">
   <Exec Command='"$(SignToolPath)" sign /debug /fd SHA256 /sha1 $(CertificateThumbprint) /t $(TimestampUrl) "%(SignMsi.FullPath)"' />
-</Target>
+ </Target>
 </Project>
