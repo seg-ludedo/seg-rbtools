@@ -59,11 +59,15 @@
  </Target>
 
  <!-- Sign the bundled installer. -->
- <Target Name="SignBundleEngine">
-  <Exec Command='"$(SignToolPath)" sign /fd SHA256 /sha1 $(CertificateThumbprint) /t $(TimestampUrl) "@(SignBundleEngine)"' />
- </Target>
+<Target Name="SignBundleEngine"
+        AfterTargets="InscribeBundleEngine"
+        Condition="'$(EnableSigning)' == 'true'">
+  <Exec Command='"$(SignToolPath)" sign /fd SHA256 /sha1 $(CertificateThumbprint) /t $(TimestampUrl) "%(SignBundleEngine.FullPath)"' />
+</Target>
 
- <Target Name="SignBundle">
+<Target Name="SignBundle"
+        AfterTargets="InscribeBundle"
+        Condition="'$(EnableSigning)' == 'true'">
   <Exec Command='"$(SignToolPath)" sign /fd SHA256 /sha1 $(CertificateThumbprint) /t $(TimestampUrl) "@(SignBundle)"' />
  </Target>
 
