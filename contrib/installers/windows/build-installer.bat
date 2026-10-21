@@ -70,9 +70,14 @@ call :InstallPython ^
     %PYTHON_X64_URL% %PYTHON_X64_SHA256% ^
     || goto :Abort
 
-call :InstallNuGet || goto :Abort
-call :InstallTrustedSigningClient || goto :Abort
-call :GenerateSigningMetadata || goto :Abort
+if not "%RBTOOLS_SKIP_SIGNING%"=="1" (
+    call :InstallNuGet || goto :Abort
+    call :InstallTrustedSigningClient || goto :Abort
+    call :GenerateSigningMetadata || goto :Abort
+) else (
+    echo.
+    echo == Skipping Azure Trusted Signing ==
+)
 call :CreateBuildDirectory || goto :Abort
 call :InstallPackages || goto :Abort
 call :InstallRBTools || goto :Abort
@@ -406,10 +411,12 @@ if ERRORLEVEL 1 exit /B 1
 
 set _rbtools_version=%_return1%
 
-:: Fetch the token as late as possible, so nothing can fail and accidentally
-:: leave it sitting around before we get a chance to clean it up.
-call :GetFederatedToken
-if ERRORLEVEL 1 exit /B 1
+
+:: Fetch a token only when signing is enabled.
+if not "%RBTOOLS_SKIP_SIGNING%"=="1" (
+    call :GetFederatedToken
+    if ERRORLEVEL 1 exit /B 1
+)
 
 set _wix_path=%CD%\wix
 set _sln_file=%_wix_path%\rbtools.sln
@@ -418,17 +425,28 @@ set _timestamp_url=http://timestamp.acs.microsoft.com
 echo.
 echo == Building the RBTools installer [x64] ==
 
-%MSBUILD% ^
-    /p:Version="%_rbtools_version%" ^
-    /p:Platform=x64 ^
-    /p:ExeSuffix=-64bit ^
-    /p:Root="%BUILD_ROOT_X64%" ^
-    /p:OutputPath="%BUILD_STAGE%\\" ^
-    /p:SourcePath="%_wix_path%" ^
-    /p:AzureSignDlibPath="%AZURE_SIGN_DLIB_PATH%" ^
-    /p:AzureSignMetadataFile="%AZURE_SIGN_METADATA_FILE%" ^
-    /p:TimestampUrl=%_timestamp_url% ^
-    "%_sln_file%"
+if "%RBTOOLS_SKIP_SIGNING%"=="1" (
+    %MSBUILD% ^
+        /p:Version="%_rbtools_version%" ^
+        /p:Platform=x64 ^
+        /p:ExeSuffix=-64bit ^
+        /p:Root="%BUILD_ROOT_X64%" ^
+        /p:OutputPath="%BUILD_STAGE%\\" ^
+        /p:SourcePath="%_wix_path%" ^
+        "%_sln_file%"
+) else (
+    %MSBUILD% ^
+        /p:Version="%_rbtools_version%" ^
+        /p:Platform=x64 ^
+        /p:ExeSuffix=-64bit ^
+        /p:Root="%BUILD_ROOT_X64%" ^
+        /p:OutputPath="%BUILD_STAGE%\\" ^
+        /p:SourcePath="%_wix_path%" ^
+        /p:AzureSignDlibPath="%AZURE_SIGN_DLIB_PATH%" ^
+        /p:AzureSignMetadataFile="%AZURE_SIGN_METADATA_FILE%" ^
+        /p:TimestampUrl=%_timestamp_url% ^
+        "%_sln_file%"
+)
 
 set _msbuild_result=%ERRORLEVEL%
 
