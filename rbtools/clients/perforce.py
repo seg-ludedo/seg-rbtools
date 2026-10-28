@@ -469,7 +469,10 @@ class P4Wrapper(object):
                         # Values are typically strings, but error payloads
                         # contain integers as well.
                         if isinstance(value, bytes):
-                            value = force_unicode(value)
+                            try:
+                                value = force_unicode(value)
+                            except UnicodeDecodeError:
+                                value = value.decode('cp1252', errors='replace')
 
                         data[key] = value
 

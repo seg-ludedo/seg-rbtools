@@ -70,14 +70,33 @@ call :InstallPython ^
     %PYTHON_X64_URL% %PYTHON_X64_SHA256% ^
     || goto :Abort
 
+::-------------------------------------------------------------------------
+:: Optional Azure Trusted Signing
+::-------------------------------------------------------------------------
+
+if "%RBTOOLS_SKIP_SIGNING%"=="1" (
+    echo.
+    echo == Skipping Azure Trusted Signing ==
+) else if not defined AZURE_TRUSTED_SIGNING_ENDPOINT (
+    echo.
+    echo == Azure Trusted Signing not configured; building unsigned ==
+    set "RBTOOLS_SKIP_SIGNING=1"
+) else if not defined AZURE_TRUSTED_SIGNING_ACCOUNT (
+    echo.
+    echo == Azure Trusted Signing not configured; building unsigned ==
+    set "RBTOOLS_SKIP_SIGNING=1"
+) else if not defined AZURE_TRUSTED_SIGNING_CERT_PROFILE (
+    echo.
+    echo == Azure Trusted Signing not configured; building unsigned ==
+    set "RBTOOLS_SKIP_SIGNING=1"
+)
+
 if not "%RBTOOLS_SKIP_SIGNING%"=="1" (
     call :InstallNuGet || goto :Abort
     call :InstallTrustedSigningClient || goto :Abort
     call :GenerateSigningMetadata || goto :Abort
-) else (
-    echo.
-    echo == Skipping Azure Trusted Signing ==
 )
+
 call :CreateBuildDirectory || goto :Abort
 call :InstallPackages || goto :Abort
 call :InstallRBTools || goto :Abort
